@@ -1,152 +1,106 @@
 import asyncio
-import os
-import logging
-import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils import executor
-from nltk.tokenize import word_tokenize
-from sklearn.feature_extraction.text import TfidfVectorizer
 import tensorflow as tf
 import numpy as np
-import config
+import pandas as pd
 
-# Настройки
-BOT_TOKEN = config.BOT_TOKEN
-GROUP_ID = config.GROUP_ID
-REVIEWERS = config.REVIEWERS
-DATABASE_URL = config.DATABASE_URL
-MAX_FEATURES = config.MAX_FEATURES
+API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+GROUP_ID = -123456789  # ID группы, откуда бот получает сообщения
+reviewers = [111111111, 222222222]  # Telegram ID модераторов
+training_data_file = "training_data.csv"
+model_file = "moderation_model.h5"
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
-logging.basicConfig(level=logging.INFO)
 
-# Инициализация модели
+# Нейросеть
+input_dim = 100  # Размер входных данных
 model = tf.keras.Sequential([
-    tf.keras.layers.InputLayer(input_shape=(MAX_FEATURES,)),
-    tf.keras.layers.Dense(256, activation='relu'),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(128, activation='relu'),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(64, activation='relu'),
+    tf.keras.layers.Dense(64, activation='relu', input_dim=input_dim),
+    tf.keras.layers.Dense(32, activation='relu'),
     tf.keras.layers.Dense(1, activation='sigmoid')
 ])
 model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
-tfidf_vectorizer = TfidfVectorizer(max_features=MAX_FEATURES, stop_words='english')
-model_loaded = False  # Флаг загрузки модели
 
-# Токенизация текста
-async def preprocess_text(text):
-    """Токенизация текста."""
-    tokens = word_tokenize(text.lower())
-    return ' '.join(tokens)
+def preprocess_text(text):
+    """Препроцессинг текста: упрощение и векторизация."""
+    # Простой пример векторизации текста
+    return np.array([hash(word) % 1000 for word in text.split()[:input_dim]]).astype(float)
 
 
-async def get_training_data(conn):
-    """Получение данных для обучения из базы данных."""
-    rows = await conn.fetch("SELECT text, label FROM training_data")
-    texts = [row["text"] for row in rows]
-    labels = [row["label"] for row in rows]
-    return texts, np.array(labels)
+def load_training_data():
+    """Загрузка обучающих данных из файла."""
+    try:
+        data = pd.read_csv(training_data_file)
+        X = np.array([eval(row) for row in data['features']])
+        y = data['label'].values
+        return X, y
+    except FileNotFoundError:
+        return np.array([]), np.array([])
 
 
-async def save_training_data(conn, text, label):
-    """Сохранение данных для обучения в базу данных."""
-    await conn.execute("INSERT INTO training_data (text, label) VALUES ($1, $2)", text, label)
+def save_training_data(features, label):
+    """Сохранение данных для обучения."""
+    new_entry = pd.DataFrame({'features': [features.tolist()], 'label': [label]})
+    if not os.path.exists(training_data_file):
+        new_entry.to_csv(training_data_file, index=False)
+    else:
+        new_entry.to_csv(training_data_file, mode='a', header=False, index=False)
 
 
-async def train_model():
-    """Обучение модели в фоновом режиме."""
-    global model, model_loaded
-    async with asyncpg.connect(DATABASE_URL) as conn:
-        texts, labels = await get_training_data(conn)
-        if len(labels) < 1000:
-            logging.info("Недостаточно данных для обучения.")
-            return
-        X = tfidf_vectorizer.fit_transform(texts).toarray()
-        model.fit(X, labels, epochs=10, batch_size=32, verbose=1)
-        model.save("moderation_model.h5")
-        model_loaded = True
-        logging.info("Модель успешно обучена.")
-
-
-async def predict_message(text):
-    """Предсказание для нового сообщения."""
-    global model, model_loaded
-    if not model_loaded and os.path.exists("moderation_model.h5"):
-        model.load_weights("moderation_model.h5")
-        model_loaded = True
-    X = tfidf_vectorizer.transform([text]).toarray()
-    prediction = model.predict(X)[0][0]
-    return prediction > 0.5
+def train_model():
+    """Обучение модели."""
+    X, y = load_training_data()
+    if len(X) >= 1000:  # Тренировать только при достижении 1000 записей
+        model.fit(X, y, epochs=10, verbose=1)
+        model.save(model_file)
 
 
 @dp.message_handler(content_types=types.ContentType.TEXT, chat_type=types.ChatType.SUPERGROUP)
 async def handle_group_message(message: types.Message):
     """Обработка сообщений из группы."""
-    try:
-        text = await preprocess_text(message.text)
+    text = message.text
+    features = preprocess_text(text)
 
-        # Проверка через модель
-        if os.path.exists("moderation_model.h5") and await predict_message(text):
+    if os.path.exists(model_file):
+        model.load_weights(model_file)
+        prediction = model.predict(np.array([features]))[0][0]
+        if prediction > 0.5:  # Условие удаления сообщения
             await message.delete()
-            await message.reply("Ваше сообщение удалено: оно не соответствует правилам.")
-            return
+            await message.reply("Ваше сообщение было удалено. Оно не соответствует правилам.")
+        return
 
-        # Рассылка модераторам
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton("Да", callback_data=f"approve_{message.message_id}_1"),
-                InlineKeyboardButton("Нет", callback_data=f"approve_{message.message_id}_0")
-            ]
-        ])
-        for reviewer in REVIEWERS:
-            try:
-                await bot.send_message(
-                    reviewer,
-                    f"Это сообщение подходит?\n\n{text}",
-                    reply_markup=markup
-                )
-            except Exception as e:
-                logging.warning(f"Ошибка отправки модератору {reviewer}: {e}")
-    except Exception as e:
-        logging.error(f"Ошибка обработки сообщения: {e}")
+    # Рассылка модераторам
+    for reviewer in reviewers:
+        try:
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton("Да", callback_data=f"approve_{message.message_id}_1"),
+                 InlineKeyboardButton("Нет", callback_data=f"approve_{message.message_id}_0")]
+            ])
+            await bot.send_message(reviewer, f"Это сообщение подходит?\n\n{text}", reply_markup=markup)
+        except Exception as e:
+            continue
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("approve_"))
 async def handle_approval(callback_query: types.CallbackQuery):
     """Обработка ответа модераторов."""
-    try:
-        _, message_id, label = callback_query.data.split("_")
-        label = int(label)
+    _, message_id, label = callback_query.data.split("_")
+    label = int(label)
 
-        message = await bot.get_message(chat_id=GROUP_ID, message_id=int(message_id))
-        text = await preprocess_text(message.text)
+    # Получение текста сообщения
+    message = await bot.get_message(chat_id=GROUP_ID, message_id=int(message_id))
+    features = preprocess_text(message.text)
 
-        async with asyncpg.connect(DATABASE_URL) as conn:
-            await save_training_data(conn, text, label)
+    # Сохранение данных для обучения
+    save_training_data(features, label)
 
-        await callback_query.answer("Спасибо за ваш ответ!")
-        asyncio.create_task(train_model())
-    except Exception as e:
-        logging.error(f"Ошибка обработки callback: {e}")
-
-
-async def setup_database():
-    """Создание таблицы в базе данных."""
-    async with asyncpg.connect(DATABASE_URL) as conn:
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS training_data (
-            id SERIAL PRIMARY KEY,
-            text TEXT NOT NULL,
-            label INT NOT NULL
-        )
-        """)
-        logging.info("Таблица training_data проверена/создана.")
+    await callback_query.answer("Спасибо за ваш ответ!")
+    train_model()
 
 
 if __name__ == "__main__":
-    asyncio.run(setup_database())
     executor.start_polling(dp, skip_updates=True)
