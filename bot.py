@@ -5,10 +5,12 @@ from aiogram.utils import executor
 import tensorflow as tf
 import numpy as np
 import pandas as pd
+import config
 
-API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-GROUP_ID = -123456789  # ID группы, откуда бот получает сообщения
-reviewers = [111111111, 222222222]  # Telegram ID модераторов
+# Настройки
+API_TOKEN = config.BOT_TOKEN
+GROUP_ID = config.GROUP_ID
+reviewers = config.REVIEWERS
 training_data_file = "training_data.csv"
 model_file = "moderation_model.h5"
 
